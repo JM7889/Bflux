@@ -1,0 +1,3 @@
+# Optional helpers for richer Excel parsing
+openpyxl
+pandas

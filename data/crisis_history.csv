@@ -1,0 +1,17 @@
+country_code,country_name,crisis_name,crisis_type,start_year,peak_year,end_year,severity,source,notes
+USA,United States,Global Financial Crisis,banking/property/credit/systemic,2007,2008,2009,severe,FCIC + Laeven-Valencia style case,"Housing bubble, easy credit, securitization, leverage, opacity, Lehman/AIG panic."
+USA,United States,Savings and Loan Crisis,banking/property/credit,1986,1989,1995,severe,starter historical case,Real estate and thrift-sector weakness.
+MEX,Mexico,Tequila Crisis,currency/sudden_stop/debt,1994,1995,1995,severe,IMF / Reinhart-Rogoff style case,"Exchange-rate pressure, capital reversal, external funding stress."
+THA,Thailand,Asian Financial Crisis,currency/banking/sudden_stop,1997,1997,1998,severe,IMF / Reinhart-Rogoff style case,"Devaluation, foreign-currency debt, banking fragility, regional contagion."
+KOR,South Korea,Asian Financial Crisis,currency/banking/sudden_stop,1997,1997,1998,severe,IMF / Reinhart-Rogoff style case,External funding stress and banking/corporate balance-sheet pressure.
+IDN,Indonesia,Asian Financial Crisis,currency/banking/sudden_stop,1997,1998,1999,severe,IMF / Reinhart-Rogoff style case,"Currency collapse, banking fragility, capital reversal."
+JPN,Japan,Asset Price and Banking Crisis,banking/property/credit,1991,1992,1998,severe,IMF / Reinhart-Rogoff style case,"Asset price bust, property pressure, banking weakness, slow recovery."
+ARG,Argentina,Argentina Crisis,currency/debt/banking,2001,2002,2002,severe,IMF / Reinhart-Rogoff style case,"Sovereign default, currency board collapse, banking stress."
+TUR,Turkey,Turkey Banking and Currency Crisis,currency/banking/debt,2000,2001,2002,severe,IMF / Reinhart-Rogoff style case,"Banking fragility, exchange-rate pressure, IMF-supported adjustment."
+RUS,Russia,Russian Financial Crisis,currency/debt/banking,1998,1998,1999,severe,IMF / Reinhart-Rogoff style case,"Default, devaluation, banking and market disruption."
+BRA,Brazil,Brazil Currency Crisis,currency/sudden_stop,1998,1999,1999,elevated,IMF / Reinhart-Rogoff style case,Exchange-rate pressure and capital-flow stress.
+CHE,Switzerland,Credit Suisse / Global Banking Stress Episode,banking/systemic/transmission,2023,2023,2023,elevated,starter case file,Banking confidence and transmission-risk episode; not a domestic macro collapse.
+GBR,United Kingdom,Northern Rock / GFC Banking Stress,banking/liquidity/property,2007,2008,2009,severe,IMF / FCIC related case,"Funding stress, property exposure, GFC transmission."
+ESP,Spain,Spanish Banking and Property Crisis,banking/property/credit,2008,2012,2013,severe,IMF / Reinhart-Rogoff style case,Property bust and banking-sector restructuring.
+IRL,Ireland,Irish Banking Crisis,banking/property/credit,2008,2010,2013,severe,IMF / Reinhart-Rogoff style case,Property boom-bust and banking-sector fiscal burden.
+GRC,Greece,Greek Sovereign Debt Crisis,debt/banking/currency_union,2010,2012,2015,severe,IMF / Reinhart-Rogoff style case,"Sovereign debt distress, banking stress, euro-area policy constraints."

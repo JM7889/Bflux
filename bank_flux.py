@@ -838,6 +838,300 @@ def global_forecasts(ds, limit=12):
     out.sort(key=lambda x: (x["horizons"][1]["likelihood"], x["vulnerability"]), reverse=True)
     return out[:limit]
 
+
+# ---------------- Crisis memory / historical calibration ----------------
+
+CRISIS_HISTORY_FILES = [
+    os.path.join(BASE_DIR, "data", "crisis_history.csv"),
+    os.path.join(BASE_DIR, "data_current", "processed", "crisis_history.csv"),
+    os.path.join(BASE_DIR, "crisis_history.csv"),
+]
+
+def normalize_crisis_row(row, source_hint=""):
+    def get(*names):
+        for n in names:
+            if n in row and row[n] not in (None, ""):
+                return row[n]
+            ln = n.lower()
+            for k, v in row.items():
+                if k and k.lower() == ln and v not in (None, ""):
+                    return v
+        return ""
+    country = resolve_country(get("country_code", "iso3", "country", "ccode"))
+    if not country or country == "GLOBAL":
+        return None
+    start = extract_year(get("start_year", "start", "year", "crisis_year"))
+    if not start:
+        return None
+    peak = extract_year(get("peak_year", "peak")) or start
+    end = extract_year(get("end_year", "end")) or peak
+    name = str(get("crisis_name", "name", "episode", "event") or f"{country} crisis {start}").strip()
+    ctype = str(get("crisis_type", "type", "category") or "financial").strip().lower()
+    severity = str(get("severity", "intensity") or "unknown").strip().lower()
+    source = str(get("source") or source_hint or "local crisis history").strip()
+    notes = str(get("notes", "note", "description") or "").strip()
+    return {
+        "country": country, "crisis_name": name, "crisis_type": ctype,
+        "start_year": int(start), "peak_year": int(peak), "end_year": int(end),
+        "severity": severity, "source": source, "notes": notes
+    }
+
+def load_crisis_history(ds=None):
+    events = []
+    # Prefer SQLite table if the fetcher created one.
+    if ds and ds.conn:
+        try:
+            tables = set(get_tables(ds.conn))
+            if "crisis_history" in tables:
+                rows = ds.conn.execute('SELECT * FROM "crisis_history"').fetchall()
+                for r in rows:
+                    ev = normalize_crisis_row(dict(r), "SQLite crisis_history")
+                    if ev:
+                        events.append(ev)
+        except Exception:
+            pass
+    # Also read CSV files if present.
+    for path in CRISIS_HISTORY_FILES:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    ev = normalize_crisis_row(row, os.path.basename(path))
+                    if ev:
+                        events.append(ev)
+        except Exception:
+            continue
+    # De-duplicate.
+    seen = set()
+    clean = []
+    for e in events:
+        key = (e["country"], e["crisis_name"].lower(), e["start_year"], e["crisis_type"])
+        if key not in seen:
+            seen.add(key)
+            clean.append(e)
+    clean.sort(key=lambda x: (x["start_year"], x["country"], x["crisis_type"]))
+    return clean
+
+def crisis_events_for_country(ds, country):
+    country = resolve_country(country)
+    return [e for e in load_crisis_history(ds) if e["country"] == country]
+
+def crisis_type_counts(events):
+    counts = defaultdict(int)
+    for e in events:
+        for part in re.split(r"[/,; ]+", e["crisis_type"]):
+            part = part.strip().lower()
+            if part:
+                counts[part] += 1
+    return sorted(counts.items(), key=lambda x: x[1], reverse=True)
+
+def vector_distance(a, b):
+    av = component_vector(a) if isinstance(a, dict) else a
+    bv = component_vector(b) if isinstance(b, dict) else b
+    if not av or not bv:
+        return None
+    return math.sqrt(sum((float(x)-float(y))**2 for x, y in zip(av, bv)) / len(av))
+
+def crisis_similarity(ds, country):
+    country = resolve_country(country)
+    current = enrich_relative(ds, country_snapshot(ds, country))
+    if not current:
+        return None
+    events = load_crisis_history(ds)
+    candidates = []
+    for ev in events:
+        # Use pre-crisis windows as calibration examples.
+        for lag in (1, 2, 3):
+            y = ev["start_year"] - lag
+            s = enrich_relative(ds, country_snapshot(ds, ev["country"], y), y)
+            if not s:
+                continue
+            dist = vector_distance(current, s)
+            if dist is None:
+                continue
+            sim = clamp(100 - dist)
+            candidates.append((sim, lag, ev, s))
+    if not candidates:
+        return {"similarity": None, "message": "No comparable pre-crisis windows were available in the local data."}
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    sim, lag, ev, s = candidates[0]
+    return {"similarity": round(sim,1), "lag_years": lag, "event": ev, "snapshot": s}
+
+def calibrated_forecast(ds, country):
+    f = forecast_country(ds, country)
+    sim = crisis_similarity(ds, country)
+    if not f:
+        return None
+    adjusted = dict(f)
+    h12 = next(h for h in f["horizons"] if h["horizon_months"] == 12)
+    if sim and sim.get("similarity") is not None:
+        # Blend model vulnerability with historical similarity.
+        cal = round(0.65 * h12["likelihood"] + 0.35 * sim["similarity"], 1)
+        adjusted["calibrated_12m"] = cal
+        adjusted["calibrated_band"] = likelihood_band(cal)
+        adjusted["crisis_similarity"] = sim
+    else:
+        adjusted["calibrated_12m"] = h12["likelihood"]
+        adjusted["calibrated_band"] = h12["band"]
+        adjusted["crisis_similarity"] = sim
+    return adjusted
+
+def print_crises(ds):
+    events = load_crisis_history(ds)
+    panel("CRISIS MEMORY", C.CYAN)
+    if not events:
+        print("No crisis_history table or crisis_history.csv file was found.")
+        print("Run: python fetch_bflux_data.py --crises")
+        return
+    countries = sorted(set(e["country"] for e in events))
+    print(wrap(f"Loaded {len(events)} historical crisis events for {len(countries)} countries. Crisis Memory is used for case review, backtesting, and calibrated vulnerability bands."))
+    rule("TYPE COUNTS", C.BLUE)
+    for t, n in crisis_type_counts(events)[:12]:
+        print(f"  {t:<18} {n:>4}")
+    rule("RECENT / IMPORTANT EVENTS", C.BLUE)
+    for e in events[-25:]:
+        print(f"  {e['start_year']}  {e['country']:<4} {e['crisis_type']:<28} {e['crisis_name']}")
+    print()
+    print(color("Commands:", C.GRAY))
+    print("  case USA 2008")
+    print("  forecast calibrated USA")
+    print("  backtest crises")
+
+def print_crisis_sources(ds):
+    events = load_crisis_history(ds)
+    panel("CRISIS SOURCES", C.CYAN)
+    if not events:
+        print("No crisis history loaded.")
+        print("Expected locations:")
+        for p in CRISIS_HISTORY_FILES:
+            print("  " + p)
+        return
+    counts = defaultdict(int)
+    for e in events:
+        counts[e["source"]] += 1
+    for src, n in sorted(counts.items(), key=lambda x: x[1], reverse=True):
+        print(f"  {src:<45} {n:>5}")
+
+def print_case(ds, country, year=None):
+    country = resolve_country(country)
+    events = crisis_events_for_country(ds, country)
+    if year:
+        events = sorted(events, key=lambda e: abs(e["start_year"] - int(year)))
+    panel(f"CRISIS CASE — {country}", C.CYAN)
+    if not events:
+        print(f"No crisis case found for {country} in the local Crisis Memory.")
+        print("Try: crises")
+        return
+    e = events[0]
+    print(f"Case: {e['crisis_name']}")
+    print(f"Type: {e['crisis_type']}    Start: {e['start_year']}    Peak: {e['peak_year']}    End: {e['end_year']}    Severity: {e['severity']}")
+    print(f"Source: {e['source']}")
+    if e.get("notes"):
+        print(wrap(e["notes"]))
+    rule("PRE-CRISIS WINDOW", C.BLUE)
+    print("Year  Raw   Rel   Banking Credit Property Macro Liquidity Market")
+    for y in range(e["start_year"] - 3, e["start_year"] + 1):
+        s = enrich_relative(ds, country_snapshot(ds, country, y), y)
+        if not s:
+            print(f"{y}   no local indicator data")
+            continue
+        print(f"{y}  {s['raw']:>5.1f} {s['relative']:>5.1f} {s['banking']:>7.1f} {s['credit']:>6.1f} {s['property']:>8.1f} {s['macro']:>5.1f} {s['liquidity']:>9.1f} {s['market']:>6.1f}")
+    rule("USE", C.MAGENTA)
+    print(wrap("Use this case to compare current signals against known pre-crisis patterns. If several channels rise together before the event, it becomes a calibration example for the forecast engine."))
+
+def print_forecast_calibrated(ds, country):
+    if is_global_token(country):
+        panel("CALIBRATED GLOBAL FORECAST", C.CYAN)
+        forecasts = []
+        for c in ds.countries():
+            cf = calibrated_forecast(ds, c)
+            if cf:
+                forecasts.append(cf)
+        forecasts.sort(key=lambda f: f.get("calibrated_12m", 0), reverse=True)
+        if not forecasts:
+            print("No calibrated forecasts could be calculated.")
+            return
+        print(wrap("This screen blends the normal Bank Flux forecast with Crisis Memory similarity. It is still an early-warning score, not a deterministic probability."))
+        rule("TOP CALIBRATED SIGNALS", C.BLUE)
+        print(f"{'Rank':<5} {'Country':<8} {'Cal12':>6} {'Band':<10} {'HistSim':>7} {'Closest crisis case'}")
+        for i, f in enumerate(forecasts[:15], 1):
+            sim = f.get("crisis_similarity") or {}
+            ev = sim.get("event") or {}
+            stxt = "n/a" if sim.get("similarity") is None else f"{sim.get('similarity'):>5.1f}"
+            print(f"{i:<5} {f['country']:<8} {f['calibrated_12m']:>6.1f} {f['calibrated_band']:<10} {stxt:>7} {ev.get('country','')}-{ev.get('start_year','')} {ev.get('crisis_type','')}")
+        return
+    f = calibrated_forecast(ds, country)
+    panel(f"CALIBRATED FORECAST — {resolve_country(country)}", C.CYAN)
+    if not f:
+        print("No forecast could be calculated.")
+        return
+    base12 = next(h for h in f["horizons"] if h["horizon_months"] == 12)
+    print(f"Baseline 12m: {base12['likelihood']:.1f} {base12['band']}    Calibrated 12m: {f['calibrated_12m']:.1f} {f['calibrated_band']}")
+    print(wrap(forecast_summary(f)))
+    sim = f.get("crisis_similarity")
+    rule("HISTORICAL SIMILARITY", C.BLUE)
+    if sim and sim.get("similarity") is not None:
+        ev = sim["event"]
+        print(f"Closest pre-crisis pattern: {ev['country']} {ev['start_year']} — {ev['crisis_name']}")
+        print(f"Similarity: {sim['similarity']:.1f}    Window: {sim['lag_years']} year(s) before crisis    Type: {ev['crisis_type']}")
+    else:
+        print("No comparable historical pre-crisis pattern was available in the local data.")
+    rule("NEXT", C.MAGENTA)
+    c = resolve_country(country)
+    print(f"  case {c}")
+    print(f"  forecast timeline {c}")
+    print(f"  sources {c}")
+
+def print_backtest_crises(ds):
+    events = load_crisis_history(ds)
+    panel("CRISIS BACKTEST", C.CYAN)
+    if not events:
+        print("No crisis history loaded. Run: python fetch_bflux_data.py --crises")
+        return
+    rows = []
+    for e in events:
+        country = e["country"]
+        if country not in ds.countries():
+            continue
+        best = None
+        for lag in (1, 2, 3):
+            y = e["start_year"] - lag
+            f = forecast_country(ds, country) if y == ds.latest_year() else None
+            s = enrich_relative(ds, country_snapshot(ds, country, y), y)
+            if not s:
+                continue
+            # approximate historical alert using vulnerability score at that time
+            series = [x for x in score_series(ds, country) if x["year"] <= y]
+            tr = trend_metrics(series)
+            vuln = vulnerability_score(s, tr)
+            if best is None or vuln > best[0]:
+                best = (vuln, lag, y, s)
+        if best:
+            rows.append((best[0], e, best[1], best[2], best[3]))
+    if not rows:
+        print("No crisis cases had enough local pre-crisis indicator history for a backtest.")
+        return
+    rows.sort(key=lambda x: x[0], reverse=True)
+    detected = sum(1 for vuln, *_ in rows if vuln >= 55)
+    print(wrap(f"Backtest cases with sufficient local data: {len(rows)}. Elevated/high pre-crisis warning cases: {detected}. This is a diagnostic backtest; it depends on available local data coverage."))
+    rule("EVENT RESULTS", C.BLUE)
+    print(f"{'Country':<8} {'Start':<6} {'Lag':<4} {'Warn':>6} {'Band':<10} {'Type'}")
+    for vuln, e, lag, y, s in rows[:40]:
+        print(f"{e['country']:<8} {e['start_year']:<6} {lag:<4} {vuln:>6.1f} {likelihood_band(vuln):<10} {e['crisis_type']}")
+
+def print_fetch_data_help():
+    panel("FETCH DATA", C.CYAN)
+    print("Run these from PowerShell in the project folder:")
+    print("  python clean_project_folder.py")
+    print("  python fetch_bflux_data.py --crises")
+    print("  python fetch_bflux_data.py --worldbank")
+    print("  python fetch_bflux_data.py --fred")
+    print("  python fetch_bflux_data.py --all")
+    print()
+    print(wrap("BIS, World Bank, Harvard/Reinhart-Rogoff crisis data, Dallas Fed housing data, and optional FRED data improve the model. Large files are saved locally and excluded from GitHub."))
+
 # ---------------- Text interpretation ----------------
 
 def coverage_note(ds):
@@ -1740,7 +2034,7 @@ def print_agent_answer(ds, text):
     panel("BFLUX AGENT", C.CYAN)
     print(wrap(
         "I can answer simple identity questions and route research questions to Bank Flux screens. "
-        "Try: explain, forecast global, explain Switzerland, banking global, compare USA CHN CHE, or what is your name."
+        "Try: explain, forecast global, forecast calibrated CHE, crises, case USA 2008, backtest crises, or what is your name."
     ))
     return True
 
@@ -1756,7 +2050,14 @@ def print_help():
         ("agent QUESTION", "lightweight BFlux conversation"),
         ("forecast global", "global crisis-likelihood map"),
         ("forecast COUNTRY", "country forecast with 6/12/24/36-month bands"),
+        ("forecast calibrated global", "Crisis Memory calibrated global forecast"),
+        ("forecast calibrated COUNTRY", "Crisis Memory calibrated country forecast"),
         ("forecast timeline COUNTRY", "historical country forecast"),
+        ("crises", "historical crisis cases loaded locally"),
+        ("crisis sources", "sources used for Crisis Memory"),
+        ("case COUNTRY YEAR", "inspect a historical crisis case"),
+        ("backtest crises", "test warning signals before known crises"),
+        ("fetch data", "show commands to fetch public datasets"),
         ("scenario COUNTRY rate_shock", "country stress test"),
         ("scenario global rate_shock", "global stress-test map"),
         ("banking global", "global banking-flow map"),
@@ -1769,7 +2070,7 @@ def print_help():
         ("copy forecast COUNTRY/global", "copy CSV to clipboard"),
         ("export forecast COUNTRY/global", "save CSV to exports folder"),
         ("copy raw COUNTRY/global", "copy evidence rows"),
-        ("backtest", "historical crisis-year check"),
+        ("backtest", "simple historical crisis-year check"),
         ("quality", "review readiness checks"),
         ("method", "research method"),
         ("data", "database status"),
@@ -1788,7 +2089,12 @@ def print_help():
         "explain Switzerland",
         "forecast global",
         "forecast CHE",
+        "forecast calibrated global",
+        "forecast calibrated CHE",
         "forecast timeline CHE",
+        "crises",
+        "case USA 2008",
+        "backtest crises",
         "scenario CHE rate_shock",
         "scenario global banking_shock",
         "banking global",
@@ -1828,7 +2134,21 @@ def natural_language_route(text, ds):
         return ("method", [])
     if "literature" in low or "book" in low:
         return ("literature", [])
+    if "fetch data" in low or "download data" in low or "fetch datasets" in low:
+        return ("fetch_data", [])
+    if low in ["crisis", "crises", "crisis memory", "crisis list"] or "list crises" in low:
+        return ("crises", [])
+    if "crisis source" in low or "crises source" in low:
+        return ("crisis_sources", [])
+    if low.startswith("case"):
+        parts = raw.split()
+        if len(parts) >= 2:
+            c = resolve_country(parts[1])
+            y = next((int(p) for p in parts[2:] if re.fullmatch(r"(19|20)\d{2}", p)), None)
+            return ("case", [c, y])
     if "backtest" in low or "historical crisis" in low:
+        if "crises" in low or "crisis" in low:
+            return ("backtest_crises", [])
         return ("backtest", [])
     if "scenario" in low or "shock" in low or "stress" in low:
         c = "GLOBAL" if has_global else (countries[0] if countries else None)
@@ -1840,6 +2160,10 @@ def natural_language_route(text, ds):
         if c and scen:
             return ("scenario", [c, scen])
     if "forecast" in low or "likelihood" in low or "predict" in low or "probability" in low:
+        if "calibrated" in low or "crisis memory" in low:
+            if has_global or not countries:
+                return ("forecast_calibrated", ["GLOBAL"])
+            return ("forecast_calibrated", [countries[0]])
         if "timeline" in low or "over time" in low:
             return ("forecast_timeline", [countries[0]]) if countries else ("forecast_global", [])
         if has_global or not countries:
@@ -1874,7 +2198,13 @@ def execute_routed(ds, action, args):
     elif action == "global": print_global(ds)
     elif action == "forecast_global": print_forecast_global(ds)
     elif action == "forecast_country": print_forecast_country(ds, args[0])
+    elif action == "forecast_calibrated": print_forecast_calibrated(ds, args[0] if args else "GLOBAL")
     elif action == "forecast_timeline": print_forecast_timeline(ds, args[0])
+    elif action == "crises": print_crises(ds)
+    elif action == "crisis_sources": print_crisis_sources(ds)
+    elif action == "case": print_case(ds, args[0] if args else "USA", args[1] if len(args) > 1 else None)
+    elif action == "backtest_crises": print_backtest_crises(ds)
+    elif action == "fetch_data": print_fetch_data_help()
     elif action == "banking_global": print_banking_global(ds)
     elif action == "banking": print_report(ds, args[0], banking_only=True)
     elif action == "compare": print_compare(ds, args)
@@ -1892,6 +2222,296 @@ def execute_routed(ds, action, args):
     return True
 
 
+
+# ---------------- Final academic release overrides ----------------
+# These definitions keep the terminal interface focused on the research objective:
+# current data + historical crisis memory + scenario analysis + evidence inspection.
+
+VERSION = "Final academic crisis-forecasting release"
+
+
+def print_home(ds):
+    clear_screen()
+    panel(f"{APP_NAME} — Crisis Forecast Console", C.CYAN)
+    print(f"Author: {color(AUTHOR_NAME, C.BOLD)}   Display date: {DISPLAY_DATE}   Version: {VERSION}")
+    dl = newest_download_time()
+    update = dl.strftime("%Y-%m-%d %H:%M") if dl else "not found"
+    print(f"Last local data update: {color(update, C.GREEN if dl else C.YELLOW)}")
+    print(f"Database: {ds.db_path or 'not found'}")
+    print(color(coverage_note(ds), C.GRAY))
+    print()
+    print(wrap(
+        "BFlux estimates financial-crisis vulnerability from public macro-financial data, banking-flow indicators, "
+        "historical timelines, scenario shocks, and Crisis Memory. Scores are early-warning research signals, not certain predictions."
+    ))
+    rule("RECOMMENDED WORKFLOW", C.BLUE)
+    rows = [
+        ("full", "complete visual review: forecast, Crisis Memory, banking-flow, next checks"),
+        ("forecast calibrated global", "global crisis-vulnerability map using Crisis Memory"),
+        ("forecast calibrated CHE", "country calibrated forecast; replace CHE with any code"),
+        ("crises", "historical crisis cases used for calibration"),
+        ("case USA 2008", "inspect a known crisis case and pre-crisis window"),
+        ("backtest crises", "test whether pre-crisis windows produced warning signals"),
+        ("scenario global banking_shock", "global stress test"),
+        ("scenario CHE rate_shock", "country stress test"),
+        ("compare USA CHN CHE MEX", "compare countries side by side"),
+        ("audit CHE", "verify evidence, data coverage, drivers, and confidence"),
+        ("sources CHE", "show source-table coverage"),
+        ("raw CHE", "show underlying observations"),
+        ("help", "all commands"),
+    ]
+    for cmd, desc in rows:
+        print(f"  {color(cmd.ljust(34), C.CYAN)} {desc}")
+
+
+def print_help():
+    panel("BFLUX COMMANDS", C.BLUE)
+    sections = [
+        ("Core review", [
+            ("full", "complete visual crisis-forecast review"),
+            ("dashboard", "guided overview"),
+            ("explain", "short professional summary of current global observations"),
+            ("explain COUNTRY", "short professional country interpretation"),
+            ("quality", "review readiness checks"),
+            ("method", "research method and limitations"),
+        ]),
+        ("Forecasting", [
+            ("forecast global", "global baseline vulnerability map"),
+            ("forecast COUNTRY", "country forecast with 6/12/24/36-month bands"),
+            ("forecast timeline COUNTRY", "historical country forecast over time"),
+            ("forecast calibrated global", "global forecast blended with Crisis Memory"),
+            ("forecast calibrated COUNTRY", "country forecast blended with historical crisis similarity"),
+        ]),
+        ("Crisis Memory", [
+            ("crises", "list historical crisis cases available to the model"),
+            ("crisis sources", "show Crisis Memory sources"),
+            ("case COUNTRY YEAR", "inspect a historical crisis case, e.g. case USA 2008"),
+            ("backtest crises", "check warning signals before known crises"),
+        ]),
+        ("Scenario and comparison", [
+            ("scenario COUNTRY rate_shock", "country stress test"),
+            ("scenario global banking_shock", "global stress-test map"),
+            ("banking global", "global banking-flow and transmission map"),
+            ("banking COUNTRY", "country banking-flow view"),
+            ("compare COUNTRIES", "side-by-side comparison"),
+            ("changes COUNTRY", "latest movement"),
+        ]),
+        ("Evidence and export", [
+            ("audit COUNTRY/global", "verify score, drivers, data confidence, and evidence"),
+            ("sources COUNTRY/global", "source-table coverage"),
+            ("raw COUNTRY/global", "underlying observations"),
+            ("copy forecast COUNTRY/global", "copy CSV to clipboard"),
+            ("export forecast COUNTRY/global", "save CSV to exports folder"),
+            ("fetch data", "show commands for crisis, World Bank, FRED, and BIS fetches"),
+            ("data", "database status"),
+            ("diagnostics", "load notes and tables"),
+            ("countries", "available country codes"),
+            ("dates", "available years"),
+            ("quit", "exit"),
+        ]),
+    ]
+    for title, rows in sections:
+        rule(title.upper(), C.MAGENTA)
+        for cmd, desc in rows:
+            print(f"  {color(cmd.ljust(36), C.CYAN)} {desc}")
+    rule("USEFUL ANALYSIS PROMPTS", C.BLUE)
+    prompts = [
+        "forecast calibrated global",
+        "forecast calibrated USA",
+        "crises",
+        "case USA 2008",
+        "case MEX 1994",
+        "case THA 1997",
+        "backtest crises",
+        "scenario global banking_shock",
+        "scenario USA rate_shock",
+        "compare USA CHN CHE MEX",
+        "audit USA",
+        "sources USA",
+        "raw USA",
+    ]
+    for q in prompts:
+        print("  " + q)
+
+
+def print_full(ds):
+    panel("FULL BFLUX CRISIS-FORECAST REVIEW", C.CYAN)
+    print(wrap(
+        "This review combines the baseline forecast, calibrated Crisis Memory forecast, historical cases, "
+        "banking-flow exposure, and recommended evidence checks. Use it as a triage screen before opening raw data."
+    ))
+    print()
+    print_forecast_calibrated(ds, "GLOBAL")
+    print()
+    print_crises(ds)
+    print()
+    print_banking_global(ds)
+    print()
+    rule("RECOMMENDED VERIFICATION", C.BLUE)
+    print("  audit USA")
+    print("  case USA 2008")
+    print("  backtest crises")
+    print("  sources USA")
+    print("  raw USA")
+
+
+def print_audit(ds, target="GLOBAL"):
+    target = resolve_country(target or "GLOBAL")
+    panel(f"AUDIT — {target}", C.CYAN)
+    print(wrap(
+        "This audit checks whether the forecast can be trusted as a research signal. It reviews data coverage, "
+        "main drivers, Crisis Memory similarity, and the evidence path."
+    ))
+    if target == "GLOBAL":
+        forecasts = global_forecasts(ds, limit=10)
+        if not forecasts:
+            print("No usable global forecasts were available.")
+            return
+        print(color(coverage_note(ds), C.GRAY))
+        rule("TOP GLOBAL SIGNALS", C.BLUE)
+        print(f"{'Country':<8} {'12m':>6} {'Band':<10} {'Vuln':>6} {'Conf':<18} {'Driver'}")
+        for f in forecasts:
+            h12 = next(h for h in f['horizons'] if h['horizon_months'] == 12)
+            print(f"{f['country']:<8} {h12['likelihood']:>6.1f} {h12['band']:<10} {f['vulnerability']:>6.1f} {f['confidence']:<18} {f['drivers'][0][0]}")
+        rule("VERIFY", C.MAGENTA)
+        print("  audit USA")
+        print("  forecast calibrated global")
+        print("  backtest crises")
+        print("  sources global")
+        return
+    f = calibrated_forecast(ds, target)
+    if not f:
+        print(f"No usable forecast was available for {target}.")
+        return
+    s = f['snapshot']
+    base12 = next(h for h in f['horizons'] if h['horizon_months'] == 12)
+    print(f"Country: {target}")
+    print(f"Latest model year: {s['year']}    Observations: {s['observations']}    Active components: {s['active_components']}/6")
+    print(f"Baseline 12m vulnerability: {base12['likelihood']:.1f} {base12['band']}")
+    print(f"Calibrated 12m vulnerability: {f['calibrated_12m']:.1f} {f['calibrated_band']}")
+    print(f"Data confidence: {f['confidence']} ({f['quality']:.1f}/100)")
+    rule("COMPONENTS", C.BLUE)
+    for g in ["banking", "credit", "property", "macro", "liquidity", "market"]:
+        v = s.get(g, 0.0)
+        print(f"  {g:<10} {v:>6.1f} {bar(v, 32)}")
+    rule("CRISIS MEMORY", C.BLUE)
+    sim = f.get('crisis_similarity') or {}
+    if sim.get('similarity') is not None:
+        ev = sim['event']
+        print(f"Closest historical pre-crisis pattern: {ev['country']} {ev['start_year']} — {ev['crisis_name']}")
+        print(f"Similarity: {sim['similarity']:.1f}    Type: {ev['crisis_type']}")
+    else:
+        print("No comparable historical pre-crisis window was available in the local data.")
+    rule("EVIDENCE COMMANDS", C.MAGENTA)
+    print(f"  forecast timeline {target}")
+    print(f"  case {target}")
+    print(f"  sources {target}")
+    print(f"  raw {target}")
+
+
+def natural_language_route(text, ds):
+    raw = text.strip()
+    low = raw.lower()
+    countries = extract_countries_from_text(raw, set(ds.countries()) | set(IMPORTANT_COUNTRIES))
+    has_global = any(w in low for w in ["global", "world", "all countries"])
+    if low in ["?", "help", "commands"]:
+        return ("help", [])
+    if low in ["full", "review", "complete review"]:
+        return ("full", [])
+    if low.startswith("audit") or "verify" in low:
+        return ("audit", ["GLOBAL" if has_global else (countries[0] if countries else "GLOBAL")])
+    if low in ["crisis", "crises", "crisis memory", "crisis list", "compare crises", "compare crisis"] or "list crises" in low:
+        return ("crises", [])
+    if "crisis source" in low or "crises source" in low:
+        return ("crisis_sources", [])
+    if low.startswith("case"):
+        parts = raw.split()
+        if len(parts) >= 2:
+            c = resolve_country(parts[1])
+            y = next((int(p) for p in parts[2:] if re.fullmatch(r"(19|20)\d{2}", p)), None)
+            return ("case", [c, y])
+    if "backtest" in low or "historical crisis" in low:
+        return ("backtest_crises", []) if "crisis" in low or "crises" in low else ("backtest", [])
+    if low.startswith("explain") or "interpret" in low or "summary" in low:
+        if "bank" in low and has_global:
+            return ("explain", ["banking", "global"])
+        if has_global:
+            return ("explain", ["global"])
+        if countries:
+            return ("explain", [countries[0]])
+        return ("explain", [])
+    if "dashboard" in low or "menu" in low:
+        return ("dashboard", [])
+    if "fetch data" in low or "download data" in low:
+        return ("fetch_data", [])
+    if "scenario" in low or "shock" in low or "stress" in low:
+        c = "GLOBAL" if has_global else (countries[0] if countries else None)
+        scen = next((s for s in SCENARIOS if s in low), None)
+        if c and scen:
+            return ("scenario", [c, scen])
+    if "forecast" in low or "likelihood" in low or "predict" in low or "probability" in low:
+        if "calibrated" in low or "crisis memory" in low:
+            return ("forecast_calibrated", ["GLOBAL" if has_global or not countries else countries[0]])
+        if "timeline" in low or "over time" in low:
+            return ("forecast_timeline", [countries[0]]) if countries else ("forecast_global", [])
+        return ("forecast_global", []) if has_global or not countries else ("forecast_country", [countries[0]])
+    if "bank" in low and has_global:
+        return ("banking_global", [])
+    if "bank" in low and countries:
+        return ("banking", [countries[0]])
+    if "compare" in low and countries:
+        return ("compare", countries)
+    if "change" in low and countries:
+        return ("changes", [countries[0]])
+    if "source" in low:
+        return ("sources", ["GLOBAL" if has_global else (countries[0] if countries else "GLOBAL")])
+    if "raw" in low or "evidence" in low:
+        return ("raw", ["GLOBAL" if has_global else (countries[0] if countries else "GLOBAL")])
+    if "date" in low or "year" in low:
+        return ("dates", [])
+    if "method" in low:
+        return ("method", [])
+    if has_global:
+        return ("forecast_global", [])
+    if countries:
+        return ("forecast_country", [countries[0]])
+    if bflux_identity_answer(raw):
+        return ("agent", [raw])
+    return ("unknown", [])
+
+
+def execute_routed(ds, action, args):
+    if action == "help": print_help()
+    elif action == "full": print_full(ds)
+    elif action == "dashboard": print_dashboard(ds)
+    elif action == "explain": print_explain(ds, args)
+    elif action == "agent": print_agent_answer(ds, args[0] if args else "")
+    elif action == "audit": print_audit(ds, args[0] if args else "GLOBAL")
+    elif action == "global": print_global(ds)
+    elif action == "forecast_global": print_forecast_global(ds)
+    elif action == "forecast_country": print_forecast_country(ds, args[0])
+    elif action == "forecast_calibrated": print_forecast_calibrated(ds, args[0] if args else "GLOBAL")
+    elif action == "forecast_timeline": print_forecast_timeline(ds, args[0])
+    elif action == "crises": print_crises(ds)
+    elif action == "crisis_sources": print_crisis_sources(ds)
+    elif action == "case": print_case(ds, args[0] if args else "USA", args[1] if len(args) > 1 else None)
+    elif action == "backtest_crises": print_backtest_crises(ds)
+    elif action == "fetch_data": print_fetch_data_help()
+    elif action == "banking_global": print_banking_global(ds)
+    elif action == "banking": print_report(ds, args[0], banking_only=True)
+    elif action == "compare": print_compare(ds, args)
+    elif action == "changes": print_changes(ds, args[0])
+    elif action == "sources": print_sources(ds, args[0])
+    elif action == "raw": print_raw(ds, args[0])
+    elif action == "dates": print_dates(ds)
+    elif action == "method": print_method()
+    elif action == "backtest": print_backtest(ds)
+    elif action == "scenario": print_scenario(ds, args[0], args[1])
+    elif action == "report": print_report(ds, args[0])
+    else:
+        print("I did not understand that yet. Try: help")
+    return True
+
 def execute_command(ds, command):
     parts = command.strip().split()
     if not parts:
@@ -1906,6 +2526,10 @@ def execute_command(ds, command):
         print_home(ds); return True
     if cmd in ["help", "?"]:
         print_help(); return True
+    if cmd in ["full", "review"]:
+        print_full(ds); return True
+    if cmd == "audit":
+        print_audit(ds, " ".join(args) if args else "GLOBAL"); return True
     if cmd in ["dashboard", "menu"]:
         print_dashboard(ds); return True
     if cmd == "explain":
@@ -1917,6 +2541,9 @@ def execute_command(ds, command):
     if cmd == "forecast":
         if not args or is_global_token(args[0]):
             print_forecast_global(ds)
+        elif args[0].lower() == "calibrated":
+            target = " ".join(args[1:]) if len(args) > 1 else "GLOBAL"
+            print_forecast_calibrated(ds, target)
         elif args[0].lower() == "timeline":
             if len(args) < 2:
                 print("Try: forecast timeline CHE")
@@ -1943,6 +2570,8 @@ def execute_command(ds, command):
         print_report(ds, " ".join(args) if args else "GLOBAL")
         return True
     if cmd == "compare":
+        if args and args[0].lower() in ["crisis", "crises"]:
+            print_crises(ds); return True
         print_compare(ds, [resolve_country(a) for a in args if a.upper() != "AND"])
         return True
     if cmd in ["timeline", "trend"]:
@@ -1951,8 +2580,28 @@ def execute_command(ds, command):
     if cmd in ["changes", "change"]:
         print_changes(ds, " ".join(args) if args else "CHE")
         return True
+    if cmd in ["crisis", "crises"]:
+        if args and args[0].lower() in ["source", "sources"]:
+            print_crisis_sources(ds)
+        else:
+            print_crises(ds)
+        return True
+    if cmd == "case":
+        if not args:
+            print("Try: case USA 2008")
+        else:
+            country = args[0]
+            year = next((int(a) for a in args[1:] if re.fullmatch(r"(19|20)\d{2}", a)), None)
+            print_case(ds, country, year)
+        return True
+    if cmd == "fetch" and args and args[0].lower() == "data":
+        print_fetch_data_help(); return True
     if cmd == "backtest":
-        print_backtest(ds); return True
+        if args and args[0].lower() in ["crisis", "crises"]:
+            print_backtest_crises(ds)
+        else:
+            print_backtest(ds)
+        return True
     if cmd == "sources":
         print_sources(ds, " ".join(args) if args else "GLOBAL")
         return True
